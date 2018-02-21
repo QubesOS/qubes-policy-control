@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env python3
 
 #
 # The Qubes OS Project, https://www.qubes-os.org/
@@ -19,29 +19,317 @@
 # with this program; if not, see <https://www.gnu.org/licenses/>.
 #
 
-cd /etc/qubes-rpc/policy
-if test "${QREXCEC_SERVICE_FULL_NAME#%%+*}" = policy.include.List
-then
-    cd include
-fi
+'''
+Qubes Policy Administrator API
 
-for i in *
-do
-    if ! test -f "$i"
-    then
-        continue
-    fi
+This is a multicall implementing the following Qubes RPC calls:
+    - policy.List()
+    - policy.List+RPCNAME()
+    - policy.Get+RPCNAME(ARGUMENT?)
+    - policy.Replace+RPCNAME(ARGUMENT?)
+    - policy.Remove+RPCNAME(ARGUMENT?)
+    - policy.include.List()
+    - policy.include.Get+FILENAME()
+    - policy.include.Replace+FILENAME()
+    - policy.include.Remove+FILENAME()
+'''
 
-    if test -n "$QREXEC_SERVICE_ARGUMENT"
-    then
-        case "$i"
-        in
-        "$QREXEC_SERVICE_ARGUMENT"+*) ;;
-        *)
+import fcntl
+import io
+import os
+import os.path
+import pathlib
+import string
+import sys
+
+import qubespolicy  # pylint: disable=import-error
+
+# Characters allowed as part of RPC name.
+# See sanitize_name() in core-admin-linux/qrexec/qrexec-daemon.c
+ALLOWED_CHARS = (
+    string.ascii_uppercase +
+    string.ascii_lowercase +
+    string.digits +
+    '$+-._')
+
+# This character should not be valid in qrexec RPC name, but should be a valid
+# character in paths in the underlying file system.
+SAFE_CHAR = '!'
+
+QREXEC_SERVICE_FULL_NAME_MAX_LENGTH = 255
+POLICY_MAX_SIZE = 65536
+
+POLICYPATH = pathlib.Path(qubespolicy.POLICY_DIR)
+INCLUDEPATH = POLICYPATH / 'include'
+
+_lockfd = None  # pylint: disable=invalid-name
+def lock():
+    '''Acquire global lock for policy manipulation'''
+    global _lockfd  # pylint: disable=global-statement,invalid-name
+    assert _lockfd is None, 'double lock'
+    _lockfd = os.open(str(POLICYPATH), os.O_DIRECTORY)
+    fcntl.flock(_lockfd, fcntl.LOCK_EX)
+
+#def unlock():
+#    global _lockfd
+#    assert _lockfd is not None, 'double unlock'
+#    os.close(_lockfd)
+#    _lockfd = None
+
+# TODO merge this in standard parser?
+class AbstractPolicyParser:
+    '''A minimal, pluggable, validating policy parser'''
+    policy_path = POLICYPATH
+
+    def load_policy_file(self, file, filename=None):
+        '''Parse a policy file'''
+        if filename is None:
+            try:
+                filename = file.name
+            except AttributeError:
+                filename = '<unknown>'
+
+        for lineno, line in enumerate(file, start=1):
+            line = line.strip()
+
+            if not line or line[0] == '#':
+                continue
+
+            if line.startswith('$include:'):
+                self.handle_include(self.policy_path / line.split(':', 1)[-1],
+                    filename=filename, lineno=lineno)
+                continue
+
+            # this can raise qubespolicy.PolicySyntaxError on its own
+            qubespolicy.PolicyRule(line, filename, lineno)
+
+    def handle_include(self, included_path, filename, lineno):
+        '''Handle ``$include:`` line when encountered in
+        :meth:`policy_load_file`.
+
+        This method is to be provided by subclass.
+        '''
+        raise NotImplementedError()
+
+class ValidateIncludesParser(AbstractPolicyParser):
+    '''A parser that checks if included file does indeed exist.
+
+    The included file is not read, because if it exists, it is assumed it
+    already passed syntax check.
+    '''
+    def handle_include(self, included_path, filename, lineno):
+        if not included_path.is_file():
+            raise qubespolicy.PolicySyntaxError(filename, lineno,
+                'included path {!s} does not exist'.format(included_path))
+
+class CheckIfNotIncludedParser(AbstractPolicyParser):
+    '''A parser that checks if a particular file is *not* included.
+
+    This is used while removing a particular file, to check that it is not used
+    anywhere else.
+    '''
+    def __init__(self, *args, to_be_removed, **kwds):
+        self.to_be_removed = to_be_removed
+        super().__init__(*args, **kwds)
+
+    def handle_include(self, included_path, filename, lineno):
+        if included_path.samefile(self.to_be_removed):
+            raise qubespolicy.PolicySyntaxError(filename, lineno,
+                'included path {!s}'.format(included_path))
+
+
+def do_list(dirpath, rpcname=None):
+    '''List files in directory, possibly only ones belonging to particular
+    rpcname'''
+    filepaths = (path for path in dirpath.iterdir()
+        if path.is_file() and not path.is_symlink())
+
+    if rpcname:
+        filepaths = (path for path in filepaths
+            if path.name == rpcname or path.name.startswith(rpcname + '+'))
+
+    for path in sorted(filepaths):
+        print(path.name)
+
+def do_get(filepath):
+    '''Read a policy file.
+
+    Exitcodes:
+        0 - success
+        1 - unspecified failure
+        2 - file does not exist or the path is not a file
+    '''
+    if not filepath.is_file():
+        sys.exit(2)
+
+    sys.stdout.buffer.write(filepath.read_bytes())
+
+def do_remove(filepath):
+    '''Remove a policy file.
+
+    Exitcodes:
+        0 - success, or file did not exists in the first place
+        1 - unspecified failure
+        2 - file was included somewhere
+    '''
+    lock()
+
+    if not filepath.exists():
+        sys.exit()
+
+    for policy in POLICYPATH.glob('**/*'):
+        if policy.is_dir():
             continue
-            ;;
-        esac
-    fi
+        if not policy.is_file():
+            # TODO warning
+            continue
 
-    printf %s\\n "$i"
-done
+        try:
+            CheckIfNotIncludedParser(to_be_removed=filepath).load_policy_file(
+                open(str(policy)))
+        except qubespolicy.PolicySyntaxError:
+            sys.exit(2)
+
+    filepath.unlink()
+
+def do_replace(filepath):
+    '''Replace a policy file, or create a new one.
+
+    Exitcodes:
+        0 - success
+        1 - unspecified failure
+        2 - file was incorrect (syntax error or included non-existing file)
+    '''
+    lock()
+
+    new_policy = io.StringIO(sys.stdin.read(POLICY_MAX_SIZE))
+    try:
+        ValidateIncludesParser().load_policy_file(new_policy,
+            filename='<uploaded file>')
+    except qubespolicy.PolicySyntaxError:
+        sys.exit(2)
+
+    tmppath = filepath.parent / (SAFE_CHAR + filepath.name)
+    assert not tmppath.exists()
+    with open(str(tmppath), 'w+') as file:
+        file.write(new_policy.getvalue())
+        file.seek(0)
+
+    tmppath.rename(filepath)
+
+def read_argument(*, stream=sys.stdin.buffer):
+    '''Read argument from standard input
+
+    May return :py:obj:`None` on "no argument" (``0xff`` byte) or EOF.
+    '''
+
+    length = stream.read(1)
+
+    if not length:
+        # Python docstring for .read() suggests there are cases when short
+        # reads do not imply EOF, so make sure no-one reads anything from there.
+        # But EOF is also valid, since someone could have just done </dev/null,
+        # so do not bail out.
+        stream.close()
+        return None
+
+    if length == b'\xff':
+        return None
+
+    length = length[0]
+    untrusted_argument = stream.read(length)
+
+    if len(untrusted_length) != length:
+        # see above
+        stream.close()
+        assert False
+
+    assert all(char in ALLOWED_CHARS for char in untrusted_argument)
+
+    argument = untrusted_argument.decode()
+    del untrusted_argument
+    return argument
+
+
+def read_argument_into_name(name, *, stream=sys.stdin.buffer):
+    '''Read argument from standard input and validate.'''
+
+    argument = read_argument(stream=stream)
+    if argument is not None:
+        name = '{}+{}'.format(name, argument)
+    assert len(name) <= QREXEC_SERVICE_FULL_NAME_MAX_LENGTH
+    return name
+
+def verify_filepath(filepath, dirpath, *, allow_create=False):
+    '''Do not allow files outside specified path
+    (``/etc/qubes-rpc/policy[/include]``), or symlinks outside.
+
+    This is a precaution, since they shouldn't be allowed by policy, but we
+    should be extra safe here. Take into account that ``.Replace`` can operate
+    on files that not yet exist.
+    '''
+
+    try:
+        filepath = filepath.resolve()
+    except FileNotFoundError:
+        if not allow_create:
+            sys.exit(1)
+
+    try:
+        if not p.parent.resolve() == dirpath:
+            sys.exit(1)
+    except FileNotFoundError:
+        sys.exit(1)
+
+def main():
+    # pylint: disable=missing-docstring
+
+    #tool = os.environ['QREXEC_SERVICE_FULL_NAME'].split('+', 1)[0]
+    tool = pathlib.Path(sys.argv[0]).name
+    is_include = tool.startswith('policy.include.')
+    try:
+        #name = os.environ['QREXEC_SERVICE_ARGUMENT']
+        name = sys.argv[1] or None
+    except LookupError:
+        name = None
+    else:
+        # Check if there is no '/' in argument. Currently this is not allowed by
+        # qrexec, but if it suddenly were, it would expose this toolkit to path
+        # traversal and consequently arbitrary code execution. Check also for
+        # os.path.*sep in case we were ported.
+        assert '/' not in name
+        assert os.path.sep not in name
+        if os.path.altsep is not None:
+            assert os.path.altsep not in name
+
+        # Argument to policy, if applicable, should be specified as first line of
+        # the payload. Argument to the policy call in question is not allowed as
+        # further part of our argument to allow for meaningful deny in policy
+        # without having to list all possible arguments.
+        assert '+' not in name
+
+    dirpath = (INCLUDEPATH if is_include else POLICYPATH)
+    if tool.endswith('.List'):
+        return do_list(dirpath, name)
+
+    if not name:
+        sys.exit(1)
+
+    if not is_include:
+        name = read_argument_into_name(name)
+    filepath = dirpath / name
+
+    verify_filepath(filepath, dirpath, allow_create=tool.endswith('.Replace'))
+
+    for suffix, handler in (
+            ('.Get', do_get),
+            ('.Remove', do_remove),
+            ('.Replace', do_replace),
+            ):
+        if tool.endswith(suffix):
+            return handler(filepath)
+
+    sys.exit(1)
+
+if __name__ == '__main__':
+    sys.exit(main())
