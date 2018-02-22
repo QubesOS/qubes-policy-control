@@ -57,6 +57,15 @@ notation convention: `rpcname+argument(payload) → dst`
 - `policy.include.List () → dom0`
   List all available files.
 
+## Proposed changes to qrexec
+
+- Qrexec calls with no argument (no `+` in `$QREXEC_SERVICE_FULL_NAME`) are
+  forbidden. The client side should append `+` to any calls for which it was not
+  supplied.
+- Qrexec calls with no characters before the first `+` (empty `$QREXEC_SERVICE`)
+  are forbidden.
+- Empty arguments are permitted and cannot be distinguished from "no argument".
+
 ## Varia
 
 - By default all calls are prohibited. The owner has to establish initial policy
