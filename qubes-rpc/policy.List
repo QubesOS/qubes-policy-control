@@ -25,9 +25,9 @@ Qubes Policy Administrator API
 This is a multicall implementing the following Qubes RPC calls:
     - policy.List()
     - policy.List+RPCNAME()
-    - policy.Get+RPCNAME(ARGUMENT?)
-    - policy.Replace+RPCNAME(ARGUMENT?)
-    - policy.Remove+RPCNAME(ARGUMENT?)
+    - policy.Get+RPCNAME(+ARGUMENT?)
+    - policy.Replace+RPCNAME(+ARGUMENT? \\n POLICY)
+    - policy.Remove+RPCNAME(+ARGUMENT?)
     - policy.include.List()
     - policy.include.Get+FILENAME()
     - policy.include.Replace+FILENAME()
@@ -50,7 +50,7 @@ ALLOWED_CHARS = (
     string.ascii_uppercase +
     string.ascii_lowercase +
     string.digits +
-    '$+-._')
+    '+-._')
 
 # This character should not be valid in qrexec RPC name, but should be a valid
 # character in paths in the underlying file system.
@@ -95,7 +95,9 @@ class AbstractPolicyParser:
             if not line or line[0] == '#':
                 continue
 
-            if line.startswith('$include:'):
+            line = line.replace('$', '@')
+
+            if line.startswith('@include:'):
                 self.handle_include(self.policy_path / line.split(':', 1)[-1],
                     filename=filename, lineno=lineno)
                 continue
@@ -141,8 +143,7 @@ class CheckIfNotIncludedParser(AbstractPolicyParser):
 def do_list(dirpath, rpcname=None):
     '''List files in directory, possibly only ones belonging to particular
     rpcname'''
-    filepaths = (path for path in dirpath.iterdir()
-        if path.is_file() and not path.is_symlink())
+    filepaths = (path for path in dirpath.iterdir() if path.is_file())
 
     if rpcname:
         filepaths = (path for path in filepaths
@@ -151,7 +152,7 @@ def do_list(dirpath, rpcname=None):
     for path in sorted(filepaths):
         print(path.name)
 
-def do_get(filepath):
+def do_get(filepath, *, stream=sys.stdout.buffer):
     '''Read a policy file.
 
     Exitcodes:
@@ -162,7 +163,11 @@ def do_get(filepath):
     if not filepath.is_file():
         sys.exit(2)
 
-    sys.stdout.buffer.write(filepath.read_bytes())
+    if filepath.is_symlink():
+        stream.write('@include:{}\n'.format(os.readlink(str(filepath))))
+    else:
+        stream.write(filepath.read_bytes())
+    stream.close()
 
 def do_remove(filepath):
     '''Remove a policy file.
@@ -202,7 +207,16 @@ def do_replace(filepath):
     '''
     lock()
 
-    new_policy = io.StringIO(sys.stdin.read(POLICY_MAX_SIZE))
+    new_policy = io.StringIO(sys.stdin.buffer.read(POLICY_MAX_SIZE).decode())
+    if sys.stdin.buffer.read(1):
+        sys.exit(1)
+    sys.stdin.buffer.close()
+
+    # Require policy that is not empty and not just whitespace. This is against
+    # buggy tools which would crash after invoking the call, but before writing
+    # the policy. If empty policy is intended, it should contain a comment.
+    assert new_policy.strip()
+
     try:
         ValidateIncludesParser().load_policy_file(new_policy,
             filename='<uploaded file>')
@@ -213,42 +227,30 @@ def do_replace(filepath):
     assert not tmppath.exists()
     with open(str(tmppath), 'w+') as file:
         file.write(new_policy.getvalue())
-        file.seek(0)
 
     tmppath.rename(filepath)
 
 def read_argument(*, stream=sys.stdin.buffer):
     '''Read argument from standard input
 
-    May return :py:obj:`None` on "no argument" (``0xff`` byte) or EOF.
+    May return :py:obj:`None` on "no argument" (empty line).
     '''
 
-    length = stream.read(1)
+    untrusted_argument = stream.readline(QREXEC_SERVICE_FULL_NAME_MAX_LENGTH)
+    assert untrusted_argument.endswith('\n')
+    untrusted_argument = untrusted_argument[:-1]
 
-    if not length:
-        # Python docstring for .read() suggests there are cases when short
-        # reads do not imply EOF, so make sure no-one reads anything from there.
-        # But EOF is also valid, since someone could have just done </dev/null,
-        # so do not bail out.
-        stream.close()
+    if not untrusted_argument:
+        del untrusted_argument
         return None
-
-    if length == b'\xff':
-        return None
-
-    length = length[0]
-    untrusted_argument = stream.read(length)
-
-    if len(untrusted_length) != length:
-        # see above
-        stream.close()
-        assert False
 
     assert all(char in ALLOWED_CHARS for char in untrusted_argument)
+    assert untrusted_argument[0] == b'+'
 
     argument = untrusted_argument.decode()
     del untrusted_argument
-    return argument
+
+    return argument or None.
 
 
 def read_argument_into_name(name, *, stream=sys.stdin.buffer):
@@ -256,7 +258,7 @@ def read_argument_into_name(name, *, stream=sys.stdin.buffer):
 
     argument = read_argument(stream=stream)
     if argument is not None:
-        name = '{}+{}'.format(name, argument)
+        name = '{}{}'.format(name, argument)
     assert len(name) <= QREXEC_SERVICE_FULL_NAME_MAX_LENGTH
     return name
 

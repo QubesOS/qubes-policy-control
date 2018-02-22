@@ -20,6 +20,11 @@ POLICY_INVALID_WRONG_INCLUDE = '''\
 $include:/dev/null
 '''
 
+# TODO
+# - symlinks
+# - various problems around argument
+# - policy.test.Setup (to be supplied with .Cleanup in auxiliary rpm)
+
 class TC_00_Integration(unittest.TestCase):
     @property
     def rpcname(self):
